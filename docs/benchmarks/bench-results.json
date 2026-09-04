@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-09-04T15:40:00+09:00",
+  "machine": {
+    "os": "Windows NT 10.0.22631.0 (registry build 22631.6199, 23H2)",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12500",
+    "logical_processors": "not available to sandbox",
+    "physical_memory_bytes": 16905490432,
+    "storage": "not available to sandbox",
+    "toolchain": "rustc 1.98.1 stable x86_64-pc-windows-gnu",
+    "build_mode": "release"
+  },
+  "spike_a": {
+    "status": "NOT_YET_VERIFIED",
+    "drive": "C:",
+    "api": "FSCTL_ENUM_USN_DATA",
+    "error": "Access denied (Windows error 5)",
+    "note": "The executable is built and runnable; this session was not elevated. No MFT speed claim is made."
+  },
+  "spike_b": {
+    "status": "MEASURED",
+    "dataset": "deterministic multilingual filename fixture",
+    "optimization_evidence": {
+      "before": "100K common-query P99 reached 40.952 ms due to per-match allocation and linear Top-K maintenance",
+      "change": "precomputed static rank bias plus a fixed 20-element heap; still a flat substring scan",
+      "after": "100K P99 range 2.342-4.766 ms"
+    },
+    "runs": [
+      {
+        "entries": 100000,
+        "iterations_per_query": 240,
+        "query_results_us": {
+          "gauss": { "p50": 1920.4, "p95": 2660.7, "p99": 2856.9, "max": 3214.0 },
+          "project": { "p50": 2078.1, "p95": 2802.0, "p99": 3085.5, "max": 3117.6 },
+          "a": { "p50": 1819.5, "p95": 2415.6, "p99": 3070.9, "max": 3391.6 },
+          "1": { "p50": 1763.8, "p95": 2264.5, "p99": 2672.2, "max": 2992.8 },
+          "가우스": { "p50": 1820.8, "p95": 2303.3, "p99": 2750.0, "max": 3122.7 },
+          "문서": { "p50": 1678.0, "p95": 2188.6, "p99": 2342.1, "max": 2495.4 },
+          "annual_project_report": { "p50": 3462.6, "p95": 3994.7, "p99": 4765.6, "max": 5946.2 }
+        }
+      },
+      {
+        "entries": 1000000,
+        "iterations_per_query": 80,
+        "query_results_us": {
+          "gauss": { "p50": 21096.9, "p95": 22575.1, "p99": 25027.1, "max": 25027.1 },
+          "project": { "p50": 22315.5, "p95": 24229.8, "p99": 27024.2, "max": 27024.2 },
+          "a": { "p50": 19845.5, "p95": 20728.8, "p99": 23477.0, "max": 23477.0 },
+          "1": { "p50": 19070.8, "p95": 20523.6, "p99": 22913.7, "max": 22913.7 },
+          "가우스": { "p50": 21743.4, "p95": 23787.1, "p99": 25423.0, "max": 25423.0 },
+          "문서": { "p50": 19330.8, "p95": 21462.9, "p99": 23713.3, "max": 23713.3 },
+          "annual_project_report": { "p50": 37211.3, "p95": 40153.7, "p99": 41708.7, "max": 41708.7 }
+        }
+      }
+    ]
+  },
+  "spike_c": {
+    "status": "MEASURED",
+    "iterations": 600,
+    "representative_results_us": [
+      { "depth": 5, "candidates": 20, "locality": "shared", "naive_p99": 0.1, "memo_p99": 1.1, "naive_walks": 100, "memo_walks": 5 },
+      { "depth": 100, "candidates": 100, "locality": "shared", "naive_p99": 11.8, "memo_p99": 4.8, "naive_walks": 10000, "memo_walks": 100 },
+      { "depth": 100, "candidates": 100, "locality": "mixed", "naive_p99": 15.8, "memo_p99": 252.9, "naive_walks": 10000, "memo_walks": 5100 },
+      { "depth": 500, "candidates": 100, "locality": "shared", "naive_p99": 104.8, "memo_p99": 22.0, "naive_walks": 50000, "memo_walks": 500 },
+      { "depth": 500, "candidates": 100, "locality": "unrelated", "naive_p99": 118.5, "memo_p99": 2236.8, "naive_walks": 50000, "memo_walks": 50000 }
+    ]
+  },
+  "desktop_alpha": {
+    "status": "MEASURED",
+    "working_set_bytes_after_render": 15921152,
+    "executable_bytes": 427520,
+    "certified_flow": ["launch", "background visible-namespace index", "Unicode query input", "result render", "selection UI", "clean close"]
+  }
+}
+

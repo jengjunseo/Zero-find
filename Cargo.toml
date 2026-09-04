@@ -1,0 +1,36 @@
+[package]
+name = "zerofind"
+version = "0.1.0"
+edition = "2024"
+authors = ["ZeroFind contributors"]
+description = "A latency-first native Windows file finder"
+license = "MIT"
+
+[lib]
+name = "zerofind"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zerofind"
+path = "src/main.rs"
+
+[[bin]]
+name = "spike_a"
+path = "src/bin/spike_a.rs"
+
+[[bin]]
+name = "spike_b"
+path = "src/bin/spike_b.rs"
+
+[[bin]]
+name = "spike_c"
+path = "src/bin/spike_c.rs"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+
+

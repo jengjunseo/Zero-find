@@ -1,0 +1,6 @@
+/target/
+/.tools/
+/artifacts/
+*.pdb
+*.ilk
+
