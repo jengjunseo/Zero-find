@@ -1,0 +1,12 @@
+index_ready_after_ui_us=118033,entries=34
+PASS korean_query,hits=30,query_to_first_row_paint_us=7166
+PASS keyboard_scroll,selected=15,scroll=8
+PASS one_result,query_to_first_row_paint_us=4933
+PASS superseded_queries_and_three_results,paint_us=7179
+PASS no_results
+PASS collapse_started
+PASS interrupted_collapse_and_reopen
+PASS actual_window_region,shape=3,corner=0,center=1
+resident_working_set_bytes=50425856
+idle_cpu_ms=15.625,idle_wall_seconds=3.003
+PASS executable_certification_complete

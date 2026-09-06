@@ -1,0 +1,9 @@
+{"spike":"B","status":"measured","dataset":"deterministic multilingual fixture","entries":1000000,"iterations":80,"queries":[
+{"query":"gauss","p50_us":58438.700,"p95_us":86925.800,"p99_us":91933.700,"max_us":91933.700},
+{"query":"project","p50_us":57271.500,"p95_us":87657.200,"p99_us":132050.200,"max_us":132050.200},
+{"query":"a","p50_us":56291.300,"p95_us":80268.200,"p99_us":92500.700,"max_us":92500.700},
+{"query":"1","p50_us":62769.900,"p95_us":90177.100,"p99_us":158042.700,"max_us":158042.700},
+{"query":"가우스","p50_us":56078.900,"p95_us":86663.500,"p99_us":108292.400,"max_us":108292.400},
+{"query":"문서","p50_us":55093.700,"p95_us":117447.500,"p99_us":121863.600,"max_us":121863.600},
+{"query":"annual_project_report","p50_us":68452.600,"p95_us":76612.800,"p99_us":143456.300,"max_us":143456.300}
+]}

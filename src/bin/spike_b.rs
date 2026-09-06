@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use zerofind::{EntryKind, FileEntry, percentile_ns, search};
 
-fn fixture(size: usize) -> Vec<FileEntry> {
+pub fn fixture(size: usize) -> Vec<FileEntry> {
     let seeds = [
         "PROJECT_GAUSS.pdf",
         "PROJECT_GAUSS_정리.hwp",
@@ -90,4 +90,3 @@ fn main() {
     }
     println!("]}}");
 }
-

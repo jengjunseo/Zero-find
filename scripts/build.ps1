@@ -1,14 +1,16 @@
 $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$env:CARGO_HOME = Join-Path $repoRoot '.tools\cargo'
-$env:RUSTUP_HOME = Join-Path $repoRoot '.tools\rustup'
-$cargo = Join-Path $env:CARGO_HOME 'bin\cargo.exe'
+$localCargo = Join-Path $repoRoot '.tools\cargo\bin\cargo.exe'
+$cargo = $localCargo
 
-if (-not (Test-Path -LiteralPath $cargo)) {
-    throw 'Rust is not installed in .tools. Install a stable x86_64-pc-windows-gnu toolchain first.'
+if (Test-Path -LiteralPath $localCargo) {
+    $env:CARGO_HOME = Join-Path $repoRoot '.tools\cargo'
+    $env:RUSTUP_HOME = Join-Path $repoRoot '.tools\rustup'
+} else {
+    $cargo = (Get-Command cargo -ErrorAction Stop).Source
 }
 
-& $cargo build --release --target x86_64-pc-windows-gnu
+& $cargo build --locked --manifest-path (Join-Path $repoRoot 'Cargo.toml') --release --target x86_64-pc-windows-gnu
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $dist = Join-Path $repoRoot 'dist'
