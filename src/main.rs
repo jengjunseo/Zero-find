@@ -1,5 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod certify;
+mod live_index;
+mod motion;
+mod renderer;
+
 use std::ffi::{OsStr, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -8,9 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::thread;
 use std::time::Instant;
-use zerofind::{
-    EntryKind, FileEntry, SearchHit, roots_from_environment, scan_visible_roots, search_cancellable,
-};
+use zerofind::{EntryKind, FileEntry, SearchHit, roots_from_environment, search_cancellable};
 
 type Hwnd = *mut c_void;
 type Hinstance = *mut c_void;
@@ -22,6 +25,13 @@ type Wparam = usize;
 type Lparam = isize;
 type Lresult = isize;
 
+const WM_COMMAND: u32 = 0x0111;
+const WM_ACTIVATEAPP: u32 = 0x001c;
+const WM_MOUSEWHEEL: u32 = 0x020a;
+const WM_DPICHANGED: u32 = 0x02e0;
+const WM_CTLCOLOREDIT: u32 = 0x0133;
+const WM_APP_METADATA: u32 = 0x8004;
+const WM_APP_INDEX_ERROR: u32 = 0x8005;
 const WM_DESTROY: u32 = 0x0002;
 const WM_PAINT: u32 = 0x000f;
 const WM_ERASEBKGND: u32 = 0x0014;
@@ -36,7 +46,6 @@ const WM_APP_INDEX_PROGRESS: u32 = 0x8001;
 const WM_APP_INDEX_READY: u32 = 0x8002;
 const WM_APP_SEARCH_READY: u32 = 0x8003;
 
-const VK_BACK: usize = 0x08;
 const VK_RETURN: usize = 0x0d;
 const VK_ESCAPE: usize = 0x1b;
 const VK_UP: usize = 0x26;
@@ -188,6 +197,42 @@ unsafe extern "system" {
     fn SetProcessDpiAwarenessContext(context: *mut c_void) -> i32;
 }
 
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+}
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn SendMessageW(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> isize;
+    fn GetWindowTextLengthW(hwnd: Hwnd) -> i32;
+    fn GetWindowTextW(hwnd: Hwnd, text: *mut u16, max: i32) -> i32;
+    fn SetWindowLongPtrW(hwnd: Hwnd, index: i32, value: isize) -> isize;
+    fn CallWindowProcW(
+        proc: isize,
+        hwnd: Hwnd,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) -> isize;
+    fn GetWindowRect(hwnd: Hwnd, rect: *mut Rect) -> i32;
+    fn GetDpiForWindow(hwnd: Hwnd) -> u32;
+    fn GetForegroundWindow() -> Hwnd;
+    fn MonitorFromWindow(hwnd: Hwnd, flags: u32) -> *mut c_void;
+    fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MonitorInfo) -> i32;
+    fn SystemParametersInfoW(action: u32, param: u32, value: *mut c_void, flags: u32) -> i32;
+    fn SetWindowTextW(hwnd: Hwnd, text: *const u16) -> i32;
+}
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn SetBkColor(hdc: Hdc, color: u32) -> u32;
+    fn SetMapMode(hdc: Hdc, mode: i32) -> i32;
+    fn SetWindowExtEx(hdc: Hdc, x: i32, y: i32, old: *mut c_void) -> i32;
+    fn SetViewportExtEx(hdc: Hdc, x: i32, y: i32, old: *mut c_void) -> i32;
+}
+
 #[link(name = "gdi32")]
 unsafe extern "system" {
     fn CreateCompatibleDC(hdc: Hdc) -> Hdc;
@@ -287,7 +332,27 @@ struct AppState {
     status: String,
     hotkey: Hotkey,
     capture_hotkey: bool,
-    opacity: u8,
+    edit: isize,
+    edit_proc: isize,
+    edit_font: isize,
+    edit_brush: isize,
+    collapsed: bool,
+    scroll: usize,
+    dpi: u32,
+    motion: motion::Motion,
+    last_frame: Instant,
+    reduced_motion: bool,
+    max_rows: usize,
+    ready_count: usize,
+    searching: bool,
+    metadata: Vec<String>,
+    meta_tx: mpsc::Sender<(u64, Vec<SearchHit>)>,
+    query_started: Instant,
+    awaiting_paint: bool,
+    suppress_char: bool,
+    last_paint_us: u128,
+    ime_composing: bool,
+    preserve_selection: Option<PathBuf>,
 }
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
@@ -295,6 +360,7 @@ static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 fn main() {
     unsafe {
         SetProcessDpiAwarenessContext(-4isize as *mut c_void);
+        let _ = windows::Win32::UI::Controls::BufferedPaintInit();
     }
     let instance = unsafe { GetModuleHandleW(null()) };
     let class_name = wide("ZeroFind.SearchIsland");
@@ -316,12 +382,22 @@ fn main() {
         return;
     }
 
-    let width = 760;
+    let width = 720;
     let height = 132;
     let x = (unsafe { GetSystemMetrics(0) } - width) / 2;
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
+            WS_EX_TOPMOST
+                | if renderer::enabled() {
+                    0
+                } else {
+                    WS_EX_LAYERED
+                }
+                | if std::env::var_os("ZEROFIND_DIAGNOSTIC_WINDOW").is_some() {
+                    0x0004_0000
+                } else {
+                    WS_EX_TOOLWINDOW
+                },
             class_name.as_ptr(),
             wide("ZeroFind").as_ptr(),
             WS_POPUP,
@@ -341,6 +417,38 @@ fn main() {
 
     configure_visuals(hwnd, width, height);
     let hotkey = load_hotkey();
+    let (meta_tx, meta_rx) = mpsc::channel();
+    let edit = unsafe {
+        CreateWindowExW(
+            0,
+            wide("EDIT").as_ptr(),
+            wide("").as_ptr(),
+            0x4000_0000 | 0x1000_0000 | 0x0080,
+            74,
+            28,
+            590,
+            32,
+            hwnd,
+            10usize as *mut c_void,
+            instance,
+            null_mut(),
+        )
+    };
+    let edit_proc = unsafe { SetWindowLongPtrW(edit, -4, edit_proc as *const () as isize) };
+    unsafe {
+        SendMessageW(
+            edit,
+            0x1501,
+            1,
+            wide("파일이나 폴더 이름 검색").as_ptr() as isize,
+        );
+        SendMessageW(edit, 0x00c5, 4096, 0);
+    }
+    let mut animations: i32 = 1;
+    unsafe {
+        SystemParametersInfoW(0x1042, 0, (&mut animations as *mut i32).cast(), 0);
+    }
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
     let entries = Arc::new(RwLock::new(Vec::new()));
     let latest_epoch = Arc::new(AtomicU64::new(0));
     let (search_tx, search_rx) = mpsc::channel();
@@ -351,19 +459,37 @@ fn main() {
         query: String::new(),
         hits: Vec::new(),
         selected: 0,
-        status: "Building your private file map…".to_string(),
+        status: "파일 목록을 준비하는 중…".to_string(),
         hotkey,
         capture_hotkey: false,
-        opacity: 222,
+        edit: edit as isize,
+        edit_proc,
+        edit_font: 0,
+        edit_brush: unsafe { CreateSolidBrush(rgb(227, 240, 250)) } as isize,
+        collapsed: false,
+        scroll: 0,
+        dpi,
+        motion: motion::Motion::new(720., 132.),
+        last_frame: Instant::now(),
+        reduced_motion: animations == 0,
+        max_rows: 8,
+        ready_count: 0,
+        searching: false,
+        metadata: Vec::new(),
+        meta_tx,
+        query_started: Instant::now(),
+        awaiting_paint: false,
+        suppress_char: false,
+        last_paint_us: 0,
+        ime_composing: false,
+        preserve_selection: None,
     }))
     .ok();
 
     let registered =
         unsafe { RegisterHotKey(hwnd, 1, hotkey.modifiers | MOD_NOREPEAT, hotkey.key) } != 0;
     if !registered {
-        with_state(|state| {
-            state.status = "Global hotkey is in use — press F2 to choose another".to_string()
-        });
+        with_state(|state| state.status = "단축키가 사용 중입니다 · F2로 변경".to_string());
     }
     start_search_worker(
         hwnd as isize,
@@ -371,13 +497,19 @@ fn main() {
         latest_epoch.clone(),
         search_rx,
     );
+    start_metadata_worker(hwnd as isize, latest_epoch, meta_rx);
     start_indexer(hwnd as isize, entries);
+    update_edit_font();
+    place_on_monitor(hwnd);
 
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
-        SetFocus(hwnd);
-        SetTimer(hwnd, 1, 12, null_mut());
+        SetFocus(edit);
+    }
+    if std::env::args().any(|arg| arg == "--certify") {
+        certify::start(hwnd);
     }
 
     let mut message: Msg = unsafe { std::mem::zeroed() };
@@ -402,31 +534,113 @@ unsafe extern "system" fn window_proc(
             return 0;
         }
         WM_TIMER => {
-            let mut done = false;
-            with_state(|state| {
-                state.opacity = state.opacity.saturating_add(4).min(248);
-                unsafe {
-                    SetLayeredWindowAttributes(hwnd, 0, state.opacity, LWA_ALPHA);
-                }
-                done = state.opacity >= 248;
-            });
-            if done {
-                unsafe {
-                    KillTimer(hwnd, 1);
-                }
+            if wparam == 2 {
+                certify::tick(hwnd);
+                return 0;
             }
+            animate(hwnd);
             return 0;
         }
         WM_HOTKEY => {
-            if unsafe { IsWindowVisible(hwnd) } != 0 {
-                unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
-                }
-            } else {
+            if with_state_value(|s| s.collapsed).unwrap_or(false)
+                || unsafe { IsWindowVisible(hwnd) } == 0
+            {
                 show_island(hwnd);
+            } else {
+                collapse_island(hwnd);
             }
             return 0;
         }
+        WM_ACTIVATEAPP if wparam == 0 => {
+            collapse_island(hwnd);
+            return 0;
+        }
+        0x0232 | 0x007e | 0x001a => {
+            // End of a drag, display topology, or work-area/accessibility change.
+            update_monitor_limits(hwnd);
+            let mut animations = 1i32;
+            unsafe {
+                SystemParametersInfoW(0x1042, 0, (&mut animations as *mut i32).cast(), 0);
+            }
+            with_state(|s| s.reduced_motion = animations == 0);
+            resize_for_content(hwnd);
+            return 0;
+        }
+        WM_DPICHANGED => {
+            with_state(|s| s.dpi = (wparam as u32 & 0xffff).max(96));
+            if lparam != 0 {
+                let r = unsafe { *(lparam as *const Rect) };
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        SWP_NOACTIVATE | 4,
+                    );
+                }
+            }
+            update_edit_font();
+            update_monitor_limits(hwnd);
+            resize_for_content(hwnd);
+            return 0;
+        }
+        WM_COMMAND if wparam & 0xffff == 10 && wparam >> 16 == 0x0300 => {
+            let edit = lparam as Hwnd;
+            let len = unsafe { GetWindowTextLengthW(edit) }.max(0) as usize;
+            let mut text = vec![0u16; len + 1];
+            let read = unsafe { GetWindowTextW(edit, text.as_mut_ptr(), text.len() as i32) }.max(0)
+                as usize;
+            with_state(|s| s.query = String::from_utf16_lossy(&text[..read]));
+            queue_search(hwnd);
+            resize_for_content(hwnd);
+            return 0;
+        }
+        WM_CTLCOLOREDIT => {
+            unsafe {
+                SetTextColor(wparam as Hdc, rgb(31, 52, 73));
+                SetBkColor(wparam as Hdc, rgb(227, 240, 250));
+            }
+            return with_state_value(|s| s.edit_brush).unwrap_or(0);
+        }
+        WM_MOUSEWHEEL => {
+            let delta = (wparam >> 16) as u16 as i16;
+            with_state(|s| {
+                if delta > 0 {
+                    s.scroll = s.scroll.saturating_sub(3);
+                } else {
+                    s.scroll = (s.scroll + 3).min(s.hits.len().saturating_sub(s.max_rows));
+                }
+            });
+            unsafe {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return 0;
+        }
+        WM_APP_METADATA => {
+            if lparam != 0 {
+                let response = unsafe { Box::from_raw(lparam as *mut (u64, Vec<String>)) };
+                with_state(|s| {
+                    if s.epoch == response.0 {
+                        s.metadata = response.1;
+                    }
+                });
+                unsafe {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+            }
+            return 0;
+        }
+        WM_APP_INDEX_ERROR => {
+            with_state(|s| s.status = "일부 위치의 변경 감지 중단 · F5로 다시 읽기".into());
+            unsafe {
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return 0;
+        }
+
         WM_KEYDOWN => {
             if handle_keydown(hwnd, wparam) {
                 return 0;
@@ -438,36 +652,50 @@ unsafe extern "system" fn window_proc(
             }
         }
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
-            let y = ((lparam >> 16) & 0xffff) as i16 as i32;
-            if y >= 94 {
-                let index = ((y - 94) / 54) as usize;
-                with_state(|state| {
-                    if index < state.hits.len() {
-                        state.selected = index;
-                    }
-                });
+            if with_state_value(|s| s.collapsed).unwrap_or(false) {
+                show_island(hwnd);
+                return 0;
+            }
+            let y = ((lparam >> 16) as u16 as i16 as i32) * 96
+                / with_state_value(|s| s.dpi).unwrap_or(96) as i32;
+            let valid = with_state_value(|s| {
+                y >= 94 && y < 94 + (s.hits.len().min(s.max_rows) as i32 * 56)
+            })
+            .unwrap_or(false);
+            if valid {
+                with_state(|s| s.selected = s.scroll + ((y - 94) / 56) as usize);
                 unsafe {
                     InvalidateRect(hwnd, null(), 0);
                 }
                 if message == WM_LBUTTONDBLCLK {
                     open_selected(hwnd, false);
                 }
+            } else {
+                if let Some(edit) = with_state_value(|s| s.edit) {
+                    unsafe {
+                        SetFocus(edit as Hwnd);
+                    }
+                }
             }
             return 0;
         }
         WM_NCHITTEST => {
-            let y = ((lparam >> 16) & 0xffff) as i16 as i32;
+            let x = lparam as u16 as i16 as i32;
+            let y = (lparam >> 16) as u16 as i16 as i32;
             let mut rect = Rect::default();
             unsafe {
-                GetClientRect(hwnd, &mut rect);
+                GetWindowRect(hwnd, &mut rect);
             }
-            if y < 125 {
+            let dpi = with_state_value(|s| s.dpi).unwrap_or(96) as i32;
+            if x - rect.left > 64 * dpi / 96 && y - rect.top < 18 * dpi / 96 {
                 return HTCAPTION;
             }
+            return 1;
         }
+
         WM_APP_INDEX_PROGRESS => {
             with_state(|state| {
-                state.status = format!("Mapping visible files… {} indexed", format_count(wparam))
+                state.status = format!("파일 목록 준비 중 · {}개", format_count(wparam))
             });
             unsafe {
                 InvalidateRect(hwnd, null(), 0);
@@ -475,14 +703,19 @@ unsafe extern "system" fn window_proc(
             return 0;
         }
         WM_APP_INDEX_READY => {
+            let selection =
+                with_state_value(|s| s.hits.get(s.selected).map(|h| h.entry.path.clone()))
+                    .flatten();
             with_state(|state| {
+                state.ready_count = wparam;
                 state.status = format!(
-                    "{} items ready  ·  {}",
+                    "{}개 항목 준비됨 · {}",
                     format_count(wparam),
                     hotkey_label(state.hotkey)
                 )
             });
             queue_search(hwnd);
+            with_state(|s| s.preserve_selection = selection);
             unsafe {
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -491,27 +724,49 @@ unsafe extern "system" fn window_proc(
         WM_APP_SEARCH_READY => {
             if lparam != 0 {
                 let response = unsafe { Box::from_raw(lparam as *mut SearchResponse) };
-                with_state(|state| {
-                    if response.epoch == state.epoch {
-                        state.hits = response.hits;
-                        state.selected = state.selected.min(state.hits.len().saturating_sub(1));
-                        state.status = format!(
-                            "{} results in {:.2} ms",
-                            state.hits.len(),
-                            response.elapsed_us as f64 / 1000.0
-                        );
+                let accepted = with_state_value(|s| response.epoch == s.epoch).unwrap_or(false);
+                if accepted {
+                    with_state(|s| {
+                        s.hits = response.hits;
+                        if let Some(path) = s.preserve_selection.take() {
+                            s.selected = s
+                                .hits
+                                .iter()
+                                .position(|h| h.entry.path == path)
+                                .unwrap_or(0);
+                            s.scroll = s.selected.saturating_sub(s.max_rows.saturating_sub(1));
+                        }
+                        s.searching = false;
+                        s.metadata.clear();
+                        s.selected = s.selected.min(s.hits.len().saturating_sub(1));
+                        s.scroll = s.scroll.min(s.hits.len().saturating_sub(s.max_rows));
+                        s.status = if s.hits.is_empty() {
+                            "일치하는 파일이 없습니다".into()
+                        } else {
+                            format!(
+                                "상위 {}개 · 검색 {:.2} ms",
+                                s.hits.len(),
+                                response.elapsed_us as f64 / 1000.
+                            )
+                        };
+                        s.awaiting_paint = true;
+                        let _ = s.meta_tx.send((s.epoch, s.hits.clone()));
+                    });
+                    resize_for_content(hwnd);
+                    unsafe {
+                        InvalidateRect(hwnd, null(), 0);
                     }
-                });
-                resize_for_content(hwnd);
-                unsafe {
-                    InvalidateRect(hwnd, null(), 0);
                 }
             }
             return 0;
         }
+
         WM_DESTROY => {
+            renderer::shutdown();
             unsafe {
+                let _ = windows::Win32::UI::Controls::BufferedPaintUnInit();
                 UnregisterHotKey(hwnd, 1);
+                KillTimer(hwnd, 1);
                 PostQuitMessage(0);
             }
             return 0;
@@ -521,13 +776,110 @@ unsafe extern "system" fn window_proc(
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
+unsafe extern "system" fn edit_proc(
+    hwnd: Hwnd,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    if message == WM_PAINT
+        && let Some(old) = with_state_value(|s| s.edit_proc)
+    {
+        paint_edit_on_glass(hwnd, old);
+        return 0;
+    }
+    if message == 0x010d {
+        with_state(|s| s.ime_composing = true);
+    }
+    if message == 0x010e {
+        with_state(|s| s.ime_composing = false);
+    }
+    let composing = with_state_value(|s| s.ime_composing).unwrap_or(false);
+    if !composing
+        && (message == WM_KEYDOWN
+            || (message == 0x0104 && with_state_value(|s| s.capture_hotkey).unwrap_or(false)))
+    {
+        with_state(|s| s.suppress_char = false);
+        let parent = unsafe { GetParent(hwnd) };
+        if handle_keydown(parent, wparam) {
+            with_state(|s| s.suppress_char = true);
+            return 0;
+        }
+        if wparam == 0x41 && unsafe { GetKeyState(VK_CONTROL) } < 0 {
+            unsafe {
+                SendMessageW(hwnd, 0x00b1, 0, -1);
+            }
+            return 0;
+        }
+    }
+    if matches!(message, WM_CHAR | 0x0106)
+        && (matches!(wparam, VK_RETURN | VK_ESCAPE)
+            || with_state_value(|s| s.capture_hotkey || s.suppress_char).unwrap_or(false))
+    {
+        return 0;
+    }
+    let old = with_state_value(|s| s.edit_proc).unwrap_or(0);
+    if old != 0 {
+        unsafe { CallWindowProcW(old, hwnd, message, wparam, lparam) }
+    } else {
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+}
+
+fn paint_edit_on_glass(hwnd: Hwnd, old: isize) {
+    use windows::Win32::{Foundation::RECT, Graphics::Gdi::HDC, UI::Controls::*};
+    let mut ps: PaintStruct = unsafe { std::mem::zeroed() };
+    let dc = unsafe { BeginPaint(hwnd, &mut ps) };
+    let mut rect = Rect::default();
+    let mut buffered_dc = HDC::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rect);
+        let r = RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+        };
+        let buffer = BeginBufferedPaint(HDC(dc), &r, BPBF_TOPDOWNDIB, None, &mut buffered_dc);
+        if buffer != 0 {
+            CallWindowProcW(old, hwnd, 0x0318, buffered_dc.0 as usize, 0x0c);
+            if GetWindowTextLengthW(hwnd) == 0
+                && !with_state_value(|s| s.ime_composing).unwrap_or(false)
+            {
+                let font = SendMessageW(hwnd, 0x0031, 0, 0);
+                let old_font = SelectObject(buffered_dc.0, font as Hgdiobj);
+                SetBkMode(buffered_dc.0, TRANSPARENT);
+                SetTextColor(buffered_dc.0, rgb(113, 140, 161));
+                let placeholder = wide("파일이나 폴더 이름 검색");
+                DrawTextW(
+                    buffered_dc.0,
+                    placeholder.as_ptr(),
+                    -1,
+                    &mut rect,
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                SelectObject(buffered_dc.0, old_font);
+            }
+            let _ = BufferedPaintSetAlpha(buffer, None, 255);
+            let _ = EndBufferedPaint(buffer, true);
+        } else {
+            CallWindowProcW(old, hwnd, 0x0318, dc as usize, 0x0c);
+        }
+        EndPaint(hwnd, &ps);
+    }
+}
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetParent(hwnd: Hwnd) -> Hwnd;
+}
+
 fn handle_keydown(hwnd: Hwnd, key: usize) -> bool {
     let capturing = with_state_value(|state| state.capture_hotkey).unwrap_or(false);
     if capturing {
         if key == VK_ESCAPE {
             with_state(|state| {
                 state.capture_hotkey = false;
-                state.status = "Hotkey change cancelled".to_string();
+                state.status = "단축키 변경 취소됨".to_string();
             });
         } else if !matches!(
             key as i32,
@@ -543,15 +895,18 @@ fn handle_keydown(hwnd: Hwnd, key: usize) -> bool {
 
     match key {
         VK_ESCAPE => {
-            unsafe {
-                ShowWindow(hwnd, SW_HIDE);
-            }
+            collapse_island(hwnd);
+            true
+        }
+        0x74 => {
+            live_index::request_refresh();
+            with_state(|s| s.status = "파일 목록 새로 고치는 중…".into());
             true
         }
         VK_F2 => {
             with_state(|state| {
                 state.capture_hotkey = true;
-                state.status = "Press your new shortcut (for example Ctrl+Alt+Space)".to_string();
+                state.status = "새 단축키를 누르세요 · Esc 취소".to_string();
             });
             unsafe {
                 InvalidateRect(hwnd, null(), 0);
@@ -559,7 +914,10 @@ fn handle_keydown(hwnd: Hwnd, key: usize) -> bool {
             true
         }
         VK_UP => {
-            with_state(|state| state.selected = state.selected.saturating_sub(1));
+            with_state(|state| {
+                state.selected = state.selected.saturating_sub(1);
+                state.scroll = state.scroll.min(state.selected);
+            });
             unsafe {
                 InvalidateRect(hwnd, null(), 0);
             }
@@ -569,6 +927,9 @@ fn handle_keydown(hwnd: Hwnd, key: usize) -> bool {
             with_state(|state| {
                 if state.selected + 1 < state.hits.len() {
                     state.selected += 1;
+                    if state.selected >= state.scroll + state.max_rows {
+                        state.scroll = state.selected + 1 - state.max_rows;
+                    }
                 }
             });
             unsafe {
@@ -585,24 +946,8 @@ fn handle_keydown(hwnd: Hwnd, key: usize) -> bool {
     }
 }
 
-fn handle_char(hwnd: Hwnd, character: u32) -> bool {
-    if character == VK_BACK as u32 {
-        with_state(|state| {
-            state.query.pop();
-        });
-    } else if character >= 0x20 && character != 0x7f {
-        if let Some(value) = char::from_u32(character) {
-            with_state(|state| state.query.push(value));
-        }
-    } else {
-        return false;
-    }
-    queue_search(hwnd);
-    resize_for_content(hwnd);
-    unsafe {
-        InvalidateRect(hwnd, null(), 0);
-    }
-    true
+fn handle_char(_hwnd: Hwnd, _character: u32) -> bool {
+    false
 }
 
 fn queue_search(hwnd: Hwnd) {
@@ -610,10 +955,20 @@ fn queue_search(hwnd: Hwnd) {
         state.epoch += 1;
         state.latest_epoch.store(state.epoch, Ordering::Relaxed);
         state.selected = 0;
+        state.preserve_selection = None;
+        state.scroll = 0;
+        state.metadata.clear();
+        state.query_started = Instant::now();
+        state.searching = !state.query.trim().is_empty();
         if state.query.trim().is_empty() {
             state.hits.clear();
+            state.status = format!(
+                "{}개 항목 · {}",
+                format_count(state.ready_count),
+                hotkey_label(state.hotkey)
+            );
         } else {
-            state.status = "Searching in memory…".to_string();
+            state.status = "검색 중…".to_string();
             let _ = state.search_tx.send(SearchRequest {
                 epoch: state.epoch,
                 query: state.query.clone(),
@@ -632,11 +987,16 @@ fn start_search_worker(
     receiver: mpsc::Receiver<SearchRequest>,
 ) {
     thread::spawn(move || {
-        while let Ok(request) = receiver.recv() {
+        while let Ok(mut request) = receiver.recv() {
+            while let Ok(newer) = receiver.try_recv() {
+                request = newer;
+            }
             let started = Instant::now();
             let hits = entries
                 .read()
-                .map(|items| search_cancellable(&items, &request.query, 20, request.epoch, &latest))
+                .map(|items| {
+                    search_cancellable(&items, &request.query, 100, request.epoch, &latest)
+                })
                 .unwrap_or_default();
             if latest.load(Ordering::Relaxed) != request.epoch {
                 continue;
@@ -646,32 +1006,118 @@ fn start_search_worker(
                 hits,
                 elapsed_us: started.elapsed().as_micros(),
             });
-            unsafe {
-                PostMessageW(
-                    hwnd as Hwnd,
-                    WM_APP_SEARCH_READY,
-                    0,
-                    Box::into_raw(response) as isize,
-                );
+            let raw = Box::into_raw(response);
+            if unsafe { PostMessageW(hwnd as Hwnd, WM_APP_SEARCH_READY, 0, raw as isize) } == 0 {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
             }
         }
     });
 }
 
 fn start_indexer(hwnd: isize, entries: Arc<RwLock<Vec<FileEntry>>>) {
+    live_index::start(
+        roots_from_environment(),
+        entries,
+        move |event, count| unsafe {
+            PostMessageW(
+                hwnd as Hwnd,
+                match event {
+                    live_index::Event::Ready => WM_APP_INDEX_READY,
+                    live_index::Event::Progress => WM_APP_INDEX_PROGRESS,
+                    live_index::Event::Error => WM_APP_INDEX_ERROR,
+                },
+                count,
+                0,
+            );
+        },
+    );
+}
+
+fn start_metadata_worker(
+    hwnd: isize,
+    latest: Arc<AtomicU64>,
+    receiver: mpsc::Receiver<(u64, Vec<SearchHit>)>,
+) {
     thread::spawn(move || {
-        let roots = roots_from_environment();
-        let indexed = scan_visible_roots(&roots, |count| unsafe {
-            PostMessageW(hwnd as Hwnd, WM_APP_INDEX_PROGRESS, count, 0);
-        });
-        let count = indexed.len();
-        if let Ok(mut destination) = entries.write() {
-            *destination = indexed;
-        }
-        unsafe {
-            PostMessageW(hwnd as Hwnd, WM_APP_INDEX_READY, count, 0);
+        while let Ok(mut request) = receiver.recv() {
+            while let Ok(newer) = receiver.try_recv() {
+                request = newer;
+            }
+            let mut details = Vec::new();
+            for hit in request.1 {
+                if latest.load(Ordering::Relaxed) != request.0 {
+                    break;
+                }
+                let value = std::fs::metadata(&hit.entry.path)
+                    .ok()
+                    .map(|m| {
+                        let size = if m.is_dir() {
+                            "폴더".into()
+                        } else if m.len() >= 1_048_576 {
+                            format!("{:.1} MB", m.len() as f64 / 1_048_576.)
+                        } else if m.len() >= 1024 {
+                            format!("{:.0} KB", m.len() as f64 / 1024.)
+                        } else {
+                            format!("{} B", m.len())
+                        };
+                        let date = m.modified().ok().map(format_modified).unwrap_or_default();
+                        format!("{date}  ·  {size}")
+                    })
+                    .unwrap_or_else(|| "정보 없음".into());
+                details.push(value);
+            }
+            if latest.load(Ordering::Relaxed) != request.0 {
+                continue;
+            }
+            let raw = Box::into_raw(Box::new((request.0, details)));
+            if unsafe { PostMessageW(hwnd as Hwnd, WM_APP_METADATA, 0, raw as isize) } == 0 {
+                unsafe {
+                    drop(Box::from_raw(raw));
+                }
+            }
         }
     });
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct SystemTime {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn FileTimeToSystemTime(file: *const u64, system: *mut SystemTime) -> i32;
+    fn SystemTimeToTzSpecificLocalTime(
+        zone: *const c_void,
+        utc: *const SystemTime,
+        local: *mut SystemTime,
+    ) -> i32;
+    fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
+}
+fn format_modified(time: std::time::SystemTime) -> String {
+    let Ok(duration) = time.duration_since(std::time::UNIX_EPOCH) else {
+        return String::new();
+    };
+    let ticks = (duration.as_secs() + 11_644_473_600) * 10_000_000;
+    let mut utc = SystemTime::default();
+    let mut local = SystemTime::default();
+    unsafe {
+        if FileTimeToSystemTime(&ticks, &mut utc) == 0
+            || SystemTimeToTzSpecificLocalTime(null(), &utc, &mut local) == 0
+        {
+            return String::new();
+        }
+    }
+    format!("{:04}.{:02}.{:02}", local.year, local.month, local.day)
 }
 
 fn capture_hotkey(hwnd: Hwnd, key: u32) {
@@ -691,11 +1137,11 @@ fn capture_hotkey(hwnd: Hwnd, key: u32) {
         }
     }
     if modifiers == 0 {
-        with_state(|state| state.status = "Use at least one modifier key".to_string());
+        with_state(|state| state.status = "Ctrl, Alt, Shift 중 하나와 함께 누르세요".to_string());
         return;
     }
     let old = with_state_value(|state| state.hotkey).unwrap_or(Hotkey {
-        modifiers: MOD_CONTROL | MOD_ALT,
+        modifiers: MOD_CONTROL | MOD_SHIFT,
         key: 0x20,
     });
     unsafe {
@@ -703,11 +1149,15 @@ fn capture_hotkey(hwnd: Hwnd, key: u32) {
     }
     let candidate = Hotkey { modifiers, key };
     if unsafe { RegisterHotKey(hwnd, 1, modifiers | MOD_NOREPEAT, key) } != 0 {
-        save_hotkey(candidate);
+        let saved = save_hotkey(candidate);
         with_state(|state| {
             state.hotkey = candidate;
             state.capture_hotkey = false;
-            state.status = format!("Hotkey saved: {}", hotkey_label(candidate));
+            state.status = if saved {
+                format!("단축키 저장됨 · {}", hotkey_label(candidate))
+            } else {
+                "단축키 적용됨 · 설정 저장 실패".into()
+            };
         });
     } else {
         unsafe {
@@ -715,14 +1165,14 @@ fn capture_hotkey(hwnd: Hwnd, key: u32) {
         }
         with_state(|state| {
             state.capture_hotkey = false;
-            state.status = "That shortcut is already in use — press F2 to retry".to_string();
+            state.status = "사용 중인 단축키입니다 · F2로 다시 변경".to_string();
         });
     }
 }
 
 fn load_hotkey() -> Hotkey {
     let fallback = Hotkey {
-        modifiers: MOD_CONTROL | MOD_ALT,
+        modifiers: MOD_CONTROL | MOD_SHIFT,
         key: 0x20,
     };
     let Some(path) = settings_path() else {
@@ -740,18 +1190,49 @@ fn load_hotkey() -> Hotkey {
             result.key = value.parse().unwrap_or(result.key);
         }
     }
+    if result.modifiers == 0 || result.modifiers & !15 != 0 || !(1..=254).contains(&result.key) {
+        return fallback;
+    }
+    if !text.lines().any(|line| line == "version=2")
+        && result.key == 0x20
+        && result.modifiers == (MOD_CONTROL | MOD_ALT)
+    {
+        return fallback;
+    }
     result
 }
 
-fn save_hotkey(hotkey: Hotkey) {
-    let Some(path) = settings_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+fn save_hotkey(hotkey: Hotkey) -> bool {
+    use std::io::Write;
+    let Some(path) = settings_path() else {
+        return false;
+    };
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return false;
     }
-    let _ = std::fs::write(
-        path,
-        format!("modifiers={}\nkey={}\n", hotkey.modifiers, hotkey.key),
-    );
+    let temp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&temp)?;
+        write!(
+            file,
+            "version=2\nmodifiers={}\nkey={}\n",
+            hotkey.modifiers, hotkey.key
+        )?;
+        file.sync_all()
+    })();
+    if written.is_err() {
+        return false;
+    }
+    unsafe {
+        MoveFileExW(
+            wide(temp.as_os_str()).as_ptr(),
+            wide(path.as_os_str()).as_ptr(),
+            1 | 8,
+        ) != 0
+    }
 }
 
 fn settings_path() -> Option<PathBuf> {
@@ -760,8 +1241,25 @@ fn settings_path() -> Option<PathBuf> {
         .map(|path| path.join("ZeroFind").join("settings.ini"))
 }
 
+fn display_path(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+}
+fn shell_path(path: &std::path::Path) -> PathBuf {
+    use std::os::windows::ffi::OsStringExt;
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if units.starts_with(&[92, 92, 63, 92]) && units.len() < 264 {
+        PathBuf::from(std::ffi::OsString::from_wide(&units[4..]))
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn open_selected(hwnd: Hwnd, containing: bool) {
     let target = with_state_value(|state| {
+        if state.searching {
+            return None;
+        }
         state
             .hits
             .get(state.selected)
@@ -775,7 +1273,8 @@ fn open_selected(hwnd: Hwnd, containing: bool) {
         path
     };
     let operation = wide("open");
-    let file = wide(destination.as_os_str());
+    let shell_destination = shell_path(&destination);
+    let file = wide(shell_destination.as_os_str());
     let result = unsafe {
         ShellExecuteW(
             hwnd,
@@ -791,7 +1290,9 @@ fn open_selected(hwnd: Hwnd, containing: bool) {
             ShowWindow(hwnd, SW_HIDE);
         }
     } else {
-        with_state(|state| state.status = "Windows could not open that item".to_string());
+        with_state(|state| {
+            state.status = "파일을 열지 못했습니다 · 이동 또는 삭제됐을 수 있습니다".to_string()
+        });
         unsafe {
             InvalidateRect(hwnd, null(), 0);
         }
@@ -799,27 +1300,118 @@ fn open_selected(hwnd: Hwnd, containing: bool) {
 }
 
 fn show_island(hwnd: Hwnd) {
-    with_state(|state| state.opacity = 222);
+    let hidden = unsafe { IsWindowVisible(hwnd) } == 0;
+    if hidden {
+        place_on_monitor(hwnd);
+    }
+    with_state(|s| s.collapsed = false);
+    resize_for_content(hwnd);
     unsafe {
-        SetLayeredWindowAttributes(hwnd, 0, 222, LWA_ALPHA);
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
-        SetFocus(hwnd);
-        SetTimer(hwnd, 1, 12, null_mut());
+        if let Some(edit) = with_state_value(|s| s.edit) {
+            ShowWindow(edit as Hwnd, SW_SHOW);
+            SetFocus(edit as Hwnd);
+        }
         InvalidateRect(hwnd, null(), 0);
     }
 }
-
+fn collapse_island(hwnd: Hwnd) {
+    with_state(|s| {
+        s.collapsed = true;
+        s.capture_hotkey = false;
+    });
+    if let Some(edit) = with_state_value(|s| s.edit) {
+        unsafe {
+            ShowWindow(edit as Hwnd, SW_HIDE);
+        }
+    }
+    resize_for_content(hwnd);
+}
 fn configure_visuals(hwnd: Hwnd, width: i32, height: i32) {
     unsafe {
-        SetLayeredWindowAttributes(hwnd, 0, 222, LWA_ALPHA);
+        SetLayeredWindowAttributes(hwnd, 0, 246, LWA_ALPHA);
         apply_dwm_backdrop(hwnd);
-        SetWindowRgn(
+        let region = CreateRoundRectRgn(0, 0, width, height, 40, 40);
+        if SetWindowRgn(hwnd, region, 1) == 0 {
+            DeleteObject(region);
+        }
+    }
+}
+fn update_edit_font() {
+    let Some((dpi, edit, old)) = with_state_value(|s| (s.dpi, s.edit, s.edit_font)) else {
+        return;
+    };
+    unsafe {
+        let font = CreateFontW(
+            -(21 * dpi as i32 / 96),
+            0,
+            0,
+            0,
+            FW_NORMAL,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            0,
+            0,
+            CLEARTYPE_QUALITY,
+            0,
+            wide("Segoe UI").as_ptr(),
+        );
+        with_state(|s| s.edit_font = font as isize);
+        SendMessageW(edit as Hwnd, 0x30, font as usize, 1);
+        if old != 0 {
+            DeleteObject(old as Hgdiobj);
+        }
+    }
+}
+
+fn work_area(hwnd: Hwnd) -> Rect {
+    let monitor = unsafe { MonitorFromWindow(hwnd, 2) };
+    let mut info = MonitorInfo {
+        size: std::mem::size_of::<MonitorInfo>() as u32,
+        monitor: Rect::default(),
+        work: Rect::default(),
+        flags: 0,
+    };
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        info.work
+    } else {
+        Rect {
+            left: 0,
+            top: 0,
+            right: unsafe { GetSystemMetrics(0) },
+            bottom: unsafe { GetSystemMetrics(1) },
+        }
+    }
+}
+fn update_monitor_limits(hwnd: Hwnd) {
+    let work = work_area(hwnd);
+    with_state(|s| {
+        let height = (work.bottom - work.top) * 96 / s.dpi as i32;
+        s.max_rows = ((height - 220) / 56).clamp(1, 8) as usize;
+    });
+}
+fn place_on_monitor(hwnd: Hwnd) {
+    let work = work_area(unsafe { GetForegroundWindow() });
+    let scale = with_state_value(|s| s.dpi as f64 / 96.).unwrap_or(1.);
+    let width = (720. * scale) as i32;
+    let x = work.left + ((work.right - work.left - width) / 2).max(0);
+    let y = work.top + ((work.bottom - work.top) / 7).min(120);
+    unsafe {
+        SetWindowPos(
             hwnd,
-            CreateRoundRectRgn(0, 0, width + 1, height + 1, 34, 34),
-            1,
+            null_mut(),
+            x,
+            y,
+            width,
+            (132. * scale) as i32,
+            SWP_NOACTIVATE | 4,
         );
     }
+    update_monitor_limits(hwnd);
+    resize_for_content(hwnd);
 }
 
 unsafe fn apply_dwm_backdrop(hwnd: Hwnd) {
@@ -836,7 +1428,7 @@ unsafe fn apply_dwm_backdrop(hwnd: Hwnd) {
         let set: SetAttribute = unsafe { std::mem::transmute(set_ptr) };
         let corners: u32 = 2;
         let backdrop: u32 = 3;
-        let dark: i32 = 1;
+        let dark: i32 = 0;
         unsafe {
             set(hwnd, 33, (&corners as *const u32).cast(), 4);
             set(hwnd, 38, (&backdrop as *const u32).cast(), 4);
@@ -846,10 +1438,12 @@ unsafe fn apply_dwm_backdrop(hwnd: Hwnd) {
     if !extend_ptr.is_null() {
         let extend: ExtendFrame = unsafe { std::mem::transmute(extend_ptr) };
         let margins = Margins {
-            left: -1,
-            right: -1,
-            top: -1,
-            bottom: -1,
+            // GDI produces no valid per-pixel alpha. Extending glass across
+            // the client makes those pixels disappear under DWM composition.
+            left: if renderer::enabled() { -1 } else { 0 },
+            right: if renderer::enabled() { -1 } else { 0 },
+            top: if renderer::enabled() { -1 } else { 0 },
+            bottom: if renderer::enabled() { -1 } else { 0 },
         };
         unsafe {
             extend(hwnd, &margins);
@@ -858,41 +1452,127 @@ unsafe fn apply_dwm_backdrop(hwnd: Hwnd) {
 }
 
 fn resize_for_content(hwnd: Hwnd) {
-    let height = with_state_value(|state| {
-        if state.query.trim().is_empty() {
-            132
-        } else if state.hits.is_empty() {
-            150
+    with_state(|s| {
+        s.motion.target_width = if s.collapsed { 64. } else { 720. };
+        s.motion.target_height = if s.collapsed {
+            64.
+        } else if s.hits.is_empty() {
+            132.
         } else {
-            118 + (state.hits.len().min(9) as i32 * 54) + 34
+            126. + s.hits.len().min(s.max_rows) as f64 * 56.
+        };
+        // The first actionable row gets space immediately; only the remaining
+        // structure animates. Never hold ready data behind a geometry transition.
+        if !s.collapsed && !s.hits.is_empty() {
+            s.motion.height = s.motion.height.max(146.);
         }
-    })
-    .unwrap_or(132);
-    let width = 760;
-    let x = (unsafe { GetSystemMetrics(0) } - width) / 2;
+        s.last_frame = Instant::now();
+    });
+    // Paint data immediately. Geometry follows it, without delaying the result message.
     unsafe {
-        SetWindowPos(hwnd, null_mut(), x, 110, width, height, SWP_NOACTIVATE);
-        SetWindowRgn(
-            hwnd,
-            CreateRoundRectRgn(0, 0, width + 1, height + 1, 34, 34),
-            1,
+        SetTimer(hwnd, 1, 16, null_mut());
+    }
+    animate(hwnd);
+}
+fn animate(hwnd: Hwnd) {
+    let mut rect = Rect::default();
+    unsafe {
+        GetWindowRect(hwnd, &mut rect);
+    }
+    let work = work_area(hwnd);
+    let values = with_state_value(|s| {
+        (
+            s.motion,
+            s.last_frame,
+            s.reduced_motion,
+            s.dpi,
+            s.edit,
+            s.collapsed,
+        )
+    });
+    let Some((mut motion, last, reduced, dpi, edit, collapsed)) = values else {
+        return;
+    };
+    let done = motion.step(last.elapsed().as_secs_f64().max(0.001), reduced);
+    let scale = dpi as f64 / 96.;
+    let width = ((motion.width * scale).round() as i32).min(work.right - work.left);
+    let height = ((motion.height * scale).round() as i32).min(work.bottom - work.top);
+    let x = rect.left.clamp(work.left, work.right - width);
+    let y = rect.top.clamp(work.top, work.bottom - height);
+    with_state(|s| {
+        s.motion = motion;
+        s.last_frame = Instant::now();
+    });
+    unsafe {
+        SetWindowPos(hwnd, null_mut(), x, y, width, height, SWP_NOACTIVATE | 4);
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            width,
+            height,
+            (40. * scale) as i32,
+            (40. * scale) as i32,
         );
+        if SetWindowRgn(hwnd, region, 0) == 0 {
+            DeleteObject(region);
+        }
+        if !collapsed {
+            SetWindowPos(
+                edit as Hwnd,
+                null_mut(),
+                (74. * scale) as i32,
+                (31. * scale) as i32,
+                (width - (104. * scale) as i32).max(1),
+                (30. * scale) as i32,
+                SWP_NOACTIVATE | 4,
+            );
+        }
+        InvalidateRect(hwnd, null(), 0);
+        if done {
+            KillTimer(hwnd, 1);
+        }
     }
 }
 
 fn paint(hwnd: Hwnd) {
-    let mut paint: PaintStruct = unsafe { std::mem::zeroed() };
-    let target = unsafe { BeginPaint(hwnd, &mut paint) };
+    let mut first_row_painted = false;
+    let mut ps: PaintStruct = unsafe { std::mem::zeroed() };
+    let target = unsafe { BeginPaint(hwnd, &mut ps) };
     let mut client = Rect::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
     }
-    let width = client.right;
-    let height = client.bottom;
     let memory = unsafe { CreateCompatibleDC(target) };
-    let bitmap = unsafe { CreateCompatibleBitmap(target, width, height) };
-    let old_bitmap = unsafe { SelectObject(memory, bitmap) };
-
+    let bitmap =
+        unsafe { CreateCompatibleBitmap(target, client.right.max(1), client.bottom.max(1)) };
+    if memory.is_null() || bitmap.is_null() {
+        unsafe {
+            if !bitmap.is_null() {
+                DeleteObject(bitmap);
+            }
+            if !memory.is_null() {
+                DeleteDC(memory);
+            }
+            EndPaint(hwnd, &ps);
+        }
+        return;
+    }
+    let old = unsafe { SelectObject(memory, bitmap) };
+    let dpi = with_state_value(|s| s.dpi).unwrap_or(96) as i32;
+    let attempted_gpu = renderer::enabled();
+    let gpu = renderer::begin(hwnd, client.right, client.bottom, dpi as u32);
+    if attempted_gpu && !gpu {
+        unsafe {
+            apply_dwm_backdrop(hwnd);
+        }
+    }
+    let width = client.right * 96 / dpi;
+    let height = client.bottom * 96 / dpi;
+    unsafe {
+        SetMapMode(memory, 8);
+        SetWindowExtEx(memory, 96, 96, null_mut());
+        SetViewportExtEx(memory, dpi, dpi, null_mut());
+    }
     fill_round(
         memory,
         Rect {
@@ -901,178 +1581,258 @@ fn paint(hwnd: Hwnd) {
             right: width,
             bottom: height,
         },
-        34,
-        rgb(8, 23, 44),
-        Some(rgb(118, 179, 221)),
+        40,
+        rgb(218, 234, 246),
+        Some(rgb(192, 214, 231)),
     );
-    fill_round(
-        memory,
-        Rect {
-            left: 22,
-            top: 20,
-            right: width - 22,
-            bottom: 82,
-        },
-        31,
-        rgb(18, 46, 76),
-        Some(rgb(92, 166, 215)),
-    );
-    draw_search_icon(memory, 49, 51);
-
-    let snapshot = with_state_value(|state| {
+    let snapshot = with_state_value(|s| {
         (
-            state.query.clone(),
-            state.hits.clone(),
-            state.selected,
-            state.status.clone(),
-            state.capture_hotkey,
-            state.hotkey,
+            s.collapsed,
+            s.hits.clone(),
+            s.selected,
+            s.scroll,
+            s.max_rows,
+            s.status.clone(),
+            s.metadata.clone(),
+            s.query.is_empty(),
         )
     });
-    if let Some((query, hits, selected, status, capturing, hotkey)) = snapshot {
-        let display = if query.is_empty() {
-            if capturing {
-                "Press a shortcut…".to_string()
-            } else {
-                "Search files instantly…".to_string()
-            }
+    if let Some((collapsed, hits, selected, scroll, rows, status, metadata, empty)) = snapshot {
+        if collapsed {
+            draw_search_icon(memory, 32, 32);
         } else {
-            query
-        };
-        draw_text(
-            memory,
-            &display,
-            Rect {
-                left: 82,
-                top: 22,
-                right: width - 42,
-                bottom: 82,
-            },
-            24,
-            FW_SEMIBOLD,
-            if display == "Search files instantly…" {
-                rgb(147, 177, 203)
-            } else {
-                rgb(239, 249, 255)
-            },
-            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-
-        if hits.is_empty() {
-            draw_text(
+            fill_round(
                 memory,
-                &status,
                 Rect {
-                    left: 34,
-                    top: 91,
-                    right: width - 34,
-                    bottom: height - 12,
+                    left: 16,
+                    top: 17,
+                    right: (width - 16).max(17),
+                    bottom: 79,
                 },
-                14,
-                FW_NORMAL,
-                rgb(142, 185, 216),
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                28,
+                rgb(227, 240, 250),
+                None,
             );
-        } else {
-            for (index, hit) in hits.iter().take(9).enumerate() {
-                let top = 94 + index as i32 * 54;
-                if index == selected {
-                    fill_round(
+            draw_search_icon(memory, 44, 48);
+            if width > 280 {
+                if hits.is_empty() {
+                    draw_text(
                         memory,
+                        if empty && status.contains("개 항목") {
+                            "이름으로 찾고, Enter로 열기"
+                        } else {
+                            &status
+                        },
                         Rect {
-                            left: 20,
-                            top,
-                            right: width - 20,
-                            bottom: top + 49,
+                            left: 28,
+                            top: 88,
+                            right: width - 28,
+                            bottom: 120,
                         },
                         13,
-                        rgb(28, 78, 119),
-                        Some(rgb(92, 178, 226)),
+                        FW_NORMAL,
+                        rgb(79, 103, 122),
+                        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
                     );
-                }
-                let marker = if hit.entry.kind == EntryKind::Directory {
-                    "□"
                 } else {
-                    "·"
-                };
-                draw_text(
-                    memory,
-                    marker,
-                    Rect {
-                        left: 37,
-                        top: top + 2,
-                        right: 64,
-                        bottom: top + 48,
-                    },
-                    21,
-                    FW_SEMIBOLD,
-                    if index == selected {
-                        rgb(116, 221, 245)
-                    } else {
-                        rgb(91, 166, 211)
-                    },
-                    DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                );
-                draw_text(
-                    memory,
-                    &hit.entry.name,
-                    Rect {
-                        left: 72,
-                        top: top + 4,
-                        right: width - 42,
-                        bottom: top + 29,
-                    },
-                    17,
-                    FW_SEMIBOLD,
-                    rgb(235, 247, 255),
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                );
-                draw_text(
-                    memory,
-                    &hit.entry.path.to_string_lossy(),
-                    Rect {
-                        left: 72,
-                        top: top + 27,
-                        right: width - 42,
-                        bottom: top + 48,
-                    },
-                    12,
-                    FW_NORMAL,
-                    rgb(131, 170, 199),
-                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-                );
+                    for (row, hit) in hits.iter().skip(scroll).take(rows).enumerate() {
+                        let index = scroll + row;
+                        let top = 94 + row as i32 * 56;
+                        if top + 50 > height {
+                            break;
+                        }
+                        first_row_painted = true;
+                        if index == selected {
+                            fill_round(
+                                memory,
+                                Rect {
+                                    left: 14,
+                                    top,
+                                    right: width - 14,
+                                    bottom: top + 52,
+                                },
+                                16,
+                                rgb(241, 248, 254),
+                                Some(rgb(199, 220, 238)),
+                            );
+                            fill_round(
+                                memory,
+                                Rect {
+                                    left: 18,
+                                    top: top + 16,
+                                    right: 21,
+                                    bottom: top + 36,
+                                },
+                                3,
+                                rgb(62, 126, 181),
+                                None,
+                            );
+                        }
+                        let marker = if hit.entry.kind == EntryKind::Directory {
+                            "DIR".to_owned()
+                        } else {
+                            hit.entry
+                                .path
+                                .extension()
+                                .and_then(|v| v.to_str())
+                                .unwrap_or("FILE")
+                                .chars()
+                                .take(4)
+                                .collect::<String>()
+                                .to_uppercase()
+                        };
+                        fill_round(
+                            memory,
+                            Rect {
+                                left: 30,
+                                top: top + 9,
+                                right: 66,
+                                bottom: top + 43,
+                            },
+                            10,
+                            rgb(205, 225, 241),
+                            None,
+                        );
+                        draw_text(
+                            memory,
+                            &marker,
+                            Rect {
+                                left: 30,
+                                top: top + 9,
+                                right: 66,
+                                bottom: top + 43,
+                            },
+                            9,
+                            FW_SEMIBOLD,
+                            rgb(60, 102, 137),
+                            DT_CENTER | DT_SINGLELINE | DT_VCENTER,
+                        );
+                        draw_text(
+                            memory,
+                            &hit.entry.name,
+                            Rect {
+                                left: 80,
+                                top: top + 4,
+                                right: width - 30,
+                                bottom: top + 28,
+                            },
+                            17,
+                            FW_NORMAL,
+                            rgb(28, 49, 67),
+                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | 0x800,
+                        );
+                        draw_text(
+                            memory,
+                            &display_path(&hit.entry.path),
+                            Rect {
+                                left: 80,
+                                top: top + 29,
+                                right: width - 224,
+                                bottom: top + 48,
+                            },
+                            12,
+                            FW_NORMAL,
+                            rgb(82, 107, 126),
+                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | 0x4000 | 0x800,
+                        );
+                        if let Some(detail) = metadata.get(index) {
+                            draw_text(
+                                memory,
+                                detail,
+                                Rect {
+                                    left: width - 216,
+                                    top: top + 29,
+                                    right: width - 30,
+                                    bottom: top + 48,
+                                },
+                                11,
+                                FW_NORMAL,
+                                rgb(88, 111, 129),
+                                2 | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                            );
+                        }
+                    }
+                    let footer = format!(
+                        "{}–{} / {}  ·  {}",
+                        scroll + 1,
+                        (scroll + rows).min(hits.len()),
+                        hits.len(),
+                        status
+                    );
+                    if height >= 126 + hits.len().min(rows) as i32 * 56 {
+                        draw_text(
+                            memory,
+                            &footer,
+                            Rect {
+                                left: 28,
+                                top: height - 29,
+                                right: width - 28,
+                                bottom: height - 7,
+                            },
+                            11,
+                            FW_NORMAL,
+                            rgb(92, 116, 134),
+                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                        );
+                    }
+                }
             }
-            let footer = format!(
-                "↑↓ Navigate   Enter Open   Ctrl+Enter Folder   F2 Hotkey ({})",
-                hotkey_label(hotkey)
-            );
-            draw_text(
-                memory,
-                &footer,
-                Rect {
-                    left: 26,
-                    top: height - 30,
-                    right: width - 26,
-                    bottom: height - 7,
-                },
-                11,
-                FW_NORMAL,
-                rgb(105, 153, 188),
-                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
         }
     }
-
     unsafe {
-        BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
-        SelectObject(memory, old_bitmap);
+        SetMapMode(memory, 1);
+        let presented = renderer::finish();
+        if !presented {
+            BitBlt(
+                target,
+                0,
+                0,
+                client.right,
+                client.bottom,
+                memory,
+                0,
+                0,
+                SRCCOPY,
+            );
+            if gpu {
+                apply_dwm_backdrop(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+            }
+        }
+        SelectObject(memory, old);
+        certify::capture_render(memory, bitmap, client.right, client.bottom);
         DeleteObject(bitmap);
         DeleteDC(memory);
-        EndPaint(hwnd, &paint);
+        EndPaint(hwnd, &ps);
     }
+    with_state(|s| {
+        if s.awaiting_paint && !s.collapsed && (s.hits.is_empty() || first_row_painted) {
+            s.awaiting_paint = false;
+            s.last_paint_us = s.query_started.elapsed().as_micros();
+            // This is CPU paint completion, not a compositor/present timestamp.
+            if let Some(path) = std::env::var_os("ZEROFIND_TIMING_LOG") {
+                use std::io::Write;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(
+                        file,
+                        "query_to_paint_us={},hits={}",
+                        s.query_started.elapsed().as_micros(),
+                        s.hits.len()
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn fill_round(hdc: Hdc, rect: Rect, radius: i32, color: u32, border: Option<u32>) {
+    if renderer::round(rect, radius, color, border) {
+        return;
+    }
     unsafe {
         let region = CreateRoundRectRgn(
             rect.left,
@@ -1095,45 +1855,29 @@ fn fill_round(hdc: Hdc, rect: Rect, radius: i32, color: u32, border: Option<u32>
 }
 
 fn draw_search_icon(hdc: Hdc, x: i32, y: i32) {
-    fill_round(
+    draw_text_face(
         hdc,
+        "\u{e721}",
         Rect {
-            left: x - 9,
-            top: y - 10,
-            right: x + 9,
-            bottom: y + 8,
-        },
-        18,
-        rgb(83, 185, 224),
-        None,
-    );
-    fill_round(
-        hdc,
-        Rect {
-            left: x - 5,
-            top: y - 6,
-            right: x + 5,
-            bottom: y + 4,
-        },
-        10,
-        rgb(18, 46, 76),
-        None,
-    );
-    fill_round(
-        hdc,
-        Rect {
-            left: x + 6,
-            top: y + 5,
+            left: x - 13,
+            top: y - 14,
             right: x + 15,
-            bottom: y + 9,
+            bottom: y + 15,
         },
-        4,
-        rgb(83, 185, 224),
-        None,
+        23,
+        FW_NORMAL,
+        rgb(65, 120, 165),
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+        "Segoe MDL2 Assets",
     );
 }
 
-fn draw_text(
+fn draw_text(hdc: Hdc, text: &str, rect: Rect, size: i32, weight: i32, color: u32, format: u32) {
+    draw_text_face(hdc, text, rect, size, weight, color, format, "Segoe UI");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_face(
     hdc: Hdc,
     text: &str,
     mut rect: Rect,
@@ -1141,26 +1885,37 @@ fn draw_text(
     weight: i32,
     color: u32,
     format: u32,
+    face: &'static str,
 ) {
-    let face = wide("Segoe UI Variable Text");
-    let font = unsafe {
-        CreateFontW(
-            -size,
-            0,
-            0,
-            0,
-            weight,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            0,
-            0,
-            CLEARTYPE_QUALITY,
-            0,
-            face.as_ptr(),
-        )
-    };
+    if renderer::text(text, rect, size, weight, color, format, face) {
+        return;
+    }
+    type Fonts = std::collections::HashMap<(i32, i32, &'static str), isize>;
+    static FONTS: OnceLock<Mutex<Fonts>> = OnceLock::new();
+    let font = *FONTS
+        .get_or_init(|| Mutex::new(Fonts::new()))
+        .lock()
+        .unwrap()
+        .entry((size, weight, face))
+        .or_insert_with(|| unsafe {
+            let face = wide(face);
+            CreateFontW(
+                -size,
+                0,
+                0,
+                0,
+                weight,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET,
+                0,
+                0,
+                CLEARTYPE_QUALITY,
+                0,
+                face.as_ptr(),
+            ) as isize
+        }) as Hgdiobj;
     let old = unsafe { SelectObject(hdc, font) };
     let value = wide(text);
     unsafe {
@@ -1174,7 +1929,6 @@ fn draw_text(
             format,
         );
         SelectObject(hdc, old);
-        DeleteObject(font);
     }
 }
 
@@ -1233,4 +1987,3 @@ fn with_state(action: impl FnOnce(&mut AppState)) {
 fn with_state_value<T>(action: impl FnOnce(&AppState) -> T) -> Option<T> {
     APP.get()?.lock().ok().map(|state| action(&state))
 }
-

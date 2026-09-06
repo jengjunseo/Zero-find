@@ -51,6 +51,7 @@ impl FileEntry {
         {
             rank_bias -= 1_800;
         }
+        rank_bias -= name.chars().count().min(240) as i32;
         Some(Self {
             name,
             normalized_name,
@@ -83,41 +84,68 @@ pub fn search_cancellable(
     epoch: u64,
     latest_epoch: &AtomicU64,
 ) -> Vec<SearchHit> {
+    search_impl(entries, query, limit, epoch, latest_epoch, true)
+}
+
+/// Measurement control: identical ranking and heap with std substring matching.
+#[doc(hidden)]
+pub fn search_reference(entries: &[FileEntry], query: &str, limit: usize) -> Vec<SearchHit> {
+    search_impl(entries, query, limit, 0, &AtomicU64::new(0), false)
+}
+
+fn search_impl(
+    entries: &[FileEntry],
+    query: &str,
+    limit: usize,
+    epoch: u64,
+    latest_epoch: &AtomicU64,
+    reuse: bool,
+) -> Vec<SearchHit> {
     let query = normalize(query);
     if query.is_empty() || limit == 0 {
         return Vec::new();
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
-    struct Candidate {
+    struct Candidate<'a> {
         index: usize,
         score: i32,
         match_start: usize,
         name_len: usize,
+        name_key: &'a str,
+        path_key: &'a Path,
     }
 
     // Reverse score order so `peek` is the current worst Top-K candidate.
-    impl Ord for Candidate {
+    impl Ord for Candidate<'_> {
         fn cmp(&self, other: &Self) -> Ordering {
             other
                 .score
                 .cmp(&self.score)
                 .then_with(|| self.name_len.cmp(&other.name_len))
-                .then_with(|| self.index.cmp(&other.index))
+                .then_with(|| self.name_key.cmp(other.name_key))
+                .then_with(|| self.path_key.cmp(other.path_key))
         }
     }
-    impl PartialOrd for Candidate {
+    impl PartialOrd for Candidate<'_> {
         fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
             Some(self.cmp(other))
         }
     }
 
     let mut candidates = BinaryHeap::<Candidate>::with_capacity(limit);
+    // Reuse query preprocessing across filenames. Both strings are valid UTF-8
+    // and the needle is nonempty, so matches have the same boundaries as str::find.
+    let finder = memchr::memmem::Finder::new(query.as_bytes());
     for (index, entry) in entries.iter().enumerate() {
         if index & 0x7ff == 0 && latest_epoch.load(AtomicOrdering::Relaxed) != epoch {
             return Vec::new();
         }
-        let Some(match_start) = entry.normalized_name.find(&query) else {
+        let Some(match_start) = (if reuse {
+            finder.find(entry.normalized_name.as_bytes())
+        } else {
+            entry.normalized_name.find(&query)
+        }) else {
             continue;
         };
         let score = rank(entry, &query, match_start);
@@ -126,12 +154,13 @@ pub fn search_cancellable(
             score,
             match_start,
             name_len: entry.name.len(),
+            name_key: &entry.normalized_name,
+            path_key: &entry.path,
         };
         if candidates.len() < limit {
             candidates.push(candidate);
         } else if let Some(worst) = candidates.peek()
-            && (candidate.score > worst.score
-                || (candidate.score == worst.score && candidate.name_len < worst.name_len))
+            && candidate < *worst
         {
             candidates.pop();
             candidates.push(candidate);
@@ -156,6 +185,7 @@ fn compare_hits(left: &SearchHit, right: &SearchHit) -> Ordering {
         .cmp(&left.score)
         .then_with(|| left.entry.name.len().cmp(&right.entry.name.len()))
         .then_with(|| left.entry.normalized_name.cmp(&right.entry.normalized_name))
+        .then_with(|| left.entry.path.cmp(&right.entry.path))
 }
 
 fn rank(entry: &FileEntry, query: &str, match_start: usize) -> i32 {
@@ -177,7 +207,7 @@ fn rank(entry: &FileEntry, query: &str, match_start: usize) -> i32 {
         }
     }
 
-    score + entry.rank_bias - entry.name.chars().count().min(240) as i32
+    score + entry.rank_bias
 }
 
 /// Walks only namespaces the current process can enumerate. Reparse targets are not followed.
@@ -186,10 +216,27 @@ where
     F: FnMut(usize),
 {
     let mut entries = Vec::new();
+    scan_visible_batches(roots, |batch| {
+        entries.extend(batch);
+        progress(entries.len());
+    });
+    entries
+}
+
+/// Streams bounded visible batches so the UI can search while bootstrapping.
+pub fn scan_visible_batches<F>(roots: &[PathBuf], mut publish: F)
+where
+    F: FnMut(Vec<FileEntry>),
+{
+    let mut entries = Vec::new();
     let mut pending = roots.to_vec();
     let mut visited = HashSet::new();
 
     while let Some(directory) = pending.pop() {
+        // Reject junctions as well as symlinks, including explicitly supplied roots.
+        if !is_plain_directory(&directory) {
+            continue;
+        }
         let key = normalize(&directory.to_string_lossy());
         if !visited.insert(key) {
             continue;
@@ -210,15 +257,32 @@ where
             if let Some(entry) = FileEntry::new(path.clone(), kind) {
                 entries.push(entry);
             }
-            if file_type.is_dir() && !file_type.is_symlink() {
+            if file_type.is_dir() && is_plain_directory(&path) {
                 pending.push(path);
             }
-            if entries.len() % 10_000 == 0 {
-                progress(entries.len());
+            if entries.len() >= 10_000 {
+                publish(std::mem::take(&mut entries));
             }
         }
     }
-    entries
+    if !entries.is_empty() {
+        publish(entries);
+    }
+}
+
+pub fn is_plain_directory(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        metadata.is_dir() && metadata.file_attributes() & 0x400 == 0
+    }
+    #[cfg(not(windows))]
+    {
+        metadata.is_dir() && !metadata.is_symlink()
+    }
 }
 
 pub fn roots_from_environment() -> Vec<PathBuf> {
@@ -231,9 +295,8 @@ pub fn roots_from_environment() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|path| path.exists())
             .collect();
-        if !roots.is_empty() {
-            return roots;
-        }
+        // An invalid diagnostic scope must never silently expand to all drives.
+        return roots;
     }
 
     #[cfg(windows)]
@@ -302,5 +365,59 @@ mod tests {
         ];
         assert_eq!(search(&entries, "project", 20)[0].entry.name, "project");
     }
-}
 
+    #[test]
+    fn reused_finder_agrees_with_unicode_string_search() {
+        let names = [
+            "가우스 보고서.txt",
+            "배포자료🦀.pdf",
+            "İstanbul_문서",
+            "a\u{301} & b_가.txt",
+            "👩‍💻.txt",
+        ];
+        for name in names {
+            let text = normalize(name);
+            let boundaries = text
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(Some(text.len()))
+                .collect::<Vec<_>>();
+            for &a in &boundaries {
+                for &b in &boundaries {
+                    if a >= b {
+                        continue;
+                    }
+                    let needle = &text[a..b];
+                    let finder = memchr::memmem::Finder::new(needle.as_bytes());
+                    assert_eq!(finder.find(text.as_bytes()), text.find(needle));
+                }
+            }
+        }
+    }
+    #[test]
+    fn limited_ties_are_independent_of_enumeration_order() {
+        let mut entries = (0..60)
+            .rev()
+            .map(|i| entry(&format!(r"C:\group{i:02}\report.txt"), EntryKind::File))
+            .collect::<Vec<_>>();
+        let first = search(&entries, "report", 20)
+            .into_iter()
+            .map(|h| h.entry.path)
+            .collect::<Vec<_>>();
+        entries.reverse();
+        assert_eq!(
+            first,
+            search(&entries, "report", 20)
+                .into_iter()
+                .map(|h| h.entry.path)
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn cancelled_queries_and_empty_limits_have_no_results() {
+        let entries = vec![entry(r"C:\보고서.txt", EntryKind::File)];
+        assert!(search_cancellable(&entries, "보고서", 20, 1, &AtomicU64::new(2)).is_empty());
+        assert!(search(&entries, "보고서", 0).is_empty());
+        assert!(search(&entries, " ", 20).is_empty());
+    }
+}

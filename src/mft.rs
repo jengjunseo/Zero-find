@@ -348,4 +348,3 @@ fn read_u64(buffer: &[u8], offset: usize) -> Option<u64> {
 fn wide_null(value: &str) -> Vec<u16> {
     OsStr::new(value).encode_wide().chain(Some(0)).collect()
 }
-

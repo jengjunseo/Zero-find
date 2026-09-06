@@ -1,0 +1,11 @@
+{"entries":100000,"limit":100,"fixture_build_us":59001,"iterations":80,"method":"alternating paired, identical ranking","queries":[
+{"query":"gauss","reference_p50_us":5987.800,"candidate_p50_us":3565.800,"reference_p99_us":6945.900,"candidate_p99_us":5125.000},
+{"query":"project","reference_p50_us":5891.000,"candidate_p50_us":3227.800,"reference_p99_us":7567.000,"candidate_p99_us":3920.700},
+{"query":"a","reference_p50_us":5334.400,"candidate_p50_us":2804.600,"reference_p99_us":6149.300,"candidate_p99_us":15390.800},
+{"query":"1","reference_p50_us":5327.500,"candidate_p50_us":2604.100,"reference_p99_us":5754.400,"candidate_p99_us":3343.000},
+{"query":"가우스","reference_p50_us":5296.600,"candidate_p50_us":3052.200,"reference_p99_us":7381.600,"candidate_p99_us":5685.400},
+{"query":"문서","reference_p50_us":5241.300,"candidate_p50_us":3150.000,"reference_p99_us":5390.900,"candidate_p99_us":3465.100},
+{"query":"annual_project_report","reference_p50_us":7372.900,"candidate_p50_us":2442.800,"reference_p99_us":7753.200,"candidate_p99_us":2765.200},
+{"query":"not-present","reference_p50_us":5561.100,"candidate_p50_us":2727.300,"reference_p99_us":6467.500,"candidate_p99_us":2911.900},
+{"query":"0000999","reference_p50_us":5040.400,"candidate_p50_us":2900.600,"reference_p99_us":6136.300,"candidate_p99_us":3455.400}
+]}
